@@ -1,10 +1,12 @@
 //! Screen and cursor capture from Hyprland through `ext-image-copy-capture-v1`
-//! into GBM-allocated dmabufs.
+//! into GBM-allocated dmabufs, or into `wl_shm` memfds where the GPU's GBM
+//! cannot map a buffer for the CPU (NVIDIA's cannot).
 //!
 //! The capture runs on its own thread with a `calloop` loop; the owner sends
 //! commands through [`Capturer`] and receives [`CaptureEvent`]s through a
 //! callback. No `unsafe`: GBM allocation and mapping use the `gbm` crate's
-//! safe API, and cursor pixels are read from a memfd with `read_at`.
+//! safe API, and memfd pixels (screen fallback and cursor) are read with
+//! `read_at`.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +15,7 @@ mod thread;
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -96,7 +99,9 @@ pub struct Plane {
     pub stride: u32,
 }
 
-/// Import information for a captured buffer.
+/// Import information for a captured buffer. A shared-memory buffer fills
+/// it in as a linear single-plane image whose fd is the memfd, which the GPU
+/// cannot import: check [`CaptureBuffer::is_dmabuf`] first.
 #[derive(Debug)]
 pub struct DmabufInfo {
     pub fd: OwnedFd,
@@ -114,8 +119,17 @@ pub struct CaptureBuffer {
     /// a release from a pre-resize frame cannot free a current buffer.
     pub generation: u64,
     pub info: DmabufInfo,
-    bo: Mutex<BufferObject<()>>,
-    device: Arc<Mutex<Device<File>>>,
+    storage: Storage,
+}
+
+/// Where a ring buffer's pixels live.
+pub(crate) enum Storage {
+    Gbm {
+        bo: Mutex<BufferObject<()>>,
+        device: Arc<Mutex<Device<File>>>,
+    },
+    /// A `wl_shm` memfd, `info.planes[0].stride` bytes per row.
+    Shm { file: File },
 }
 
 impl std::fmt::Debug for CaptureBuffer {
@@ -128,14 +142,27 @@ impl std::fmt::Debug for CaptureBuffer {
 }
 
 impl CaptureBuffer {
+    /// Whether this is a GPU dmabuf the encoder can import; false for a
+    /// shared-memory buffer, which only the CPU path reads.
+    pub fn is_dmabuf(&self) -> bool {
+        matches!(self.storage, Storage::Gbm { .. })
+    }
+
     /// Map the whole buffer for CPU reads and run `f(pixels, stride_bytes)`.
     pub fn with_mapped<R>(&self, f: impl FnOnce(&[u8], u32) -> R) -> Result<R> {
-        let device = self
-            .device
+        let (bo, device) = match &self.storage {
+            Storage::Gbm { bo, device } => (bo, device),
+            Storage::Shm { file } => {
+                let stride = self.info.planes[0].stride;
+                let mut pixels = vec![0u8; stride as usize * self.info.height as usize];
+                file.read_exact_at(&mut pixels, 0)?;
+                return Ok(f(&pixels, stride));
+            }
+        };
+        let device = device
             .lock()
             .map_err(|_| Error::Gbm("device mutex poisoned".into()))?;
-        let bo = self
-            .bo
+        let bo = bo
             .lock()
             .map_err(|_| Error::Gbm("buffer mutex poisoned".into()))?;
         let (w, h) = (self.info.width, self.info.height);
