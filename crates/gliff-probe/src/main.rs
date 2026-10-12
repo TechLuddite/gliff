@@ -1523,6 +1523,11 @@ fn pipeline(
         modifier: info.modifier,
     };
 
+    if video == VideoMode::Gpu && !frame.buffer.is_dmabuf() {
+        bail!(
+            "the capture is in shared memory (this GPU's GBM cannot map buffers, or GLIFF_SHM_CAPTURE=1), which the GPU pipeline cannot import; the server uses the CPU pipeline here: try --video cpu"
+        );
+    }
     let gpu = match video {
         VideoMode::Gpu => Some(Gpu::open(Some(node))?),
         VideoMode::Cpu => None,

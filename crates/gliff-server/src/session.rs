@@ -1296,6 +1296,12 @@ impl VideoEncoder {
     ) -> Result<EncodedFrame> {
         match self {
             Self::Gpu(enc) => {
+                // A shared-memory capture (a GPU whose GBM cannot map) has
+                // no dmabuf; this error moves the session to the CPU path.
+                anyhow::ensure!(
+                    frame.buffer.is_dmabuf(),
+                    "the capture is in shared memory, which the GPU encoder cannot import"
+                );
                 let info = &frame.buffer.info;
                 let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
                     anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)

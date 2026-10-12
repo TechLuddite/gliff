@@ -1,12 +1,13 @@
 //! The capture thread: Wayland dispatch, buffer ring, session state machine.
 
 use std::fs::File;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use calloop::channel::{self, Sender};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObjectFlags, Device};
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -14,7 +15,7 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
-use wayland_client::protocol::wl_shm::WlShm;
+use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
@@ -37,7 +38,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 use crate::cursor::ShmBuffer;
 use crate::{
     CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink,
-    OutputInfo, Plane, Rect, Result,
+    OutputInfo, Plane, Rect, Result, Storage,
 };
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
@@ -96,6 +97,9 @@ struct State {
     ring: Vec<RingSlot>,
     ring_generation: u64,
     ring_format: Option<(u32, u64)>,
+    /// The ring is in shared memory: GBM could not map a buffer for the CPU
+    /// (or `GLIFF_SHM_CAPTURE=1` asked for it). Kept for the session.
+    use_shm: bool,
     in_flight: Option<(ExtImageCopyCaptureFrameV1, usize)>,
     pending_damage: Vec<Rect>,
     pending_presentation: u64,
@@ -189,6 +193,7 @@ fn run(
         ring: Vec::new(),
         ring_generation: 0,
         ring_format: None,
+        use_shm: std::env::var_os("GLIFF_SHM_CAPTURE").is_some_and(|v| v == "1"),
         in_flight: None,
         pending_damage: Vec::new(),
         pending_presentation: 0,
@@ -383,6 +388,9 @@ impl State {
 
     fn allocate_ring(&mut self) -> Result<()> {
         self.ring_generation += 1;
+        if self.use_shm {
+            return self.allocate_shm_ring();
+        }
         let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
             Error::Capture(format!(
                 "no usable dmabuf format offered (got {:x?})",
@@ -417,6 +425,17 @@ impl State {
                     )
                 })
                 .map_err(|e| Error::Gbm(format!("allocate {w}x{h} {format:?}: {e}")))?;
+            // The CPU encoder reads every frame through a GBM map. NVIDIA's
+            // GBM refuses it (ENOENT), so find out on the first buffer and
+            // capture into shared memory instead.
+            if index == 0 && self.shm.is_some() {
+                if let Ok(Err(e)) = bo.map(&device, 0, 0, 1, 1, |_| ()) {
+                    drop(device);
+                    tracing::warn!(error = %e, "GBM cannot map capture buffers; capturing into shared memory");
+                    self.use_shm = true;
+                    return self.allocate_shm_ring();
+                }
+            }
             drop(device);
             let modifier: u64 = bo.modifier().map_err(|e| Error::Gbm(e.to_string()))?.into();
             let plane_count = bo.plane_count().map_err(|e| Error::Gbm(e.to_string()))?;
@@ -462,8 +481,10 @@ impl State {
                     modifier,
                     planes,
                 },
-                bo: Mutex::new(bo),
-                device: Arc::clone(&self.device),
+                storage: Storage::Gbm {
+                    bo: Mutex::new(bo),
+                    device: Arc::clone(&self.device),
+                },
             });
             self.ring.push(RingSlot {
                 buffer,
@@ -480,6 +501,88 @@ impl State {
             modifier = format!("{modifier:#x}"),
             buffers = self.cfg.buffers,
             "capture ring allocated"
+        );
+        let output = self
+            .output
+            .as_ref()
+            .map(|(_, i)| i.clone())
+            .unwrap_or_default();
+        self.emit(CaptureEvent::Ready {
+            output,
+            width: w,
+            height: h,
+            fourcc,
+            modifier,
+        });
+        Ok(())
+    }
+
+    /// The ring in `wl_shm` memfds, for a GPU whose GBM cannot map buffers
+    /// for the CPU. Only the CPU encoder can read these.
+    fn allocate_shm_ring(&mut self) -> Result<()> {
+        let shm = self.shm.clone().ok_or_else(|| {
+            Error::Capture("capture needs shared memory, and the compositor has no wl_shm".into())
+        })?;
+        let (shm_format, fourcc) =
+            choose_shm_format(&self.constraints.shm_formats).ok_or_else(|| {
+                Error::Capture(format!(
+                    "no usable shm format offered (got {:x?})",
+                    self.constraints.shm_formats
+                ))
+            })?;
+        let (w, h) = (self.constraints.width, self.constraints.height);
+        for slot in self.ring.drain(..) {
+            slot.wl_buffer.destroy();
+        }
+        let stride = w * 4;
+        let size = u64::from(stride) * u64::from(h);
+        let pool_size = i32::try_from(size)
+            .map_err(|_| Error::Capture(format!("{w}x{h} is too large for a wl_shm pool")))?;
+        for index in 0..self.cfg.buffers {
+            let fd = memfd_create(c"gliff-capture", MFdFlags::MFD_CLOEXEC)
+                .map_err(|e| Error::Capture(format!("memfd: {e}")))?;
+            let file = File::from(fd);
+            file.set_len(size)?;
+            let pool = shm.create_pool(file.as_fd(), pool_size, &self.qh, ());
+            let wl_buffer = pool.create_buffer(
+                0,
+                w as i32,
+                h as i32,
+                stride as i32,
+                shm_format,
+                &self.qh,
+                (),
+            );
+            // The buffer keeps the memory; the pool is not needed again.
+            pool.destroy();
+            let info_fd: OwnedFd = file.try_clone()?.into();
+            let buffer = Arc::new(CaptureBuffer {
+                index,
+                generation: self.ring_generation,
+                info: DmabufInfo {
+                    fd: info_fd,
+                    width: w,
+                    height: h,
+                    fourcc,
+                    modifier: u64::from(DrmModifier::Linear),
+                    planes: vec![Plane { offset: 0, stride }],
+                },
+                storage: Storage::Shm { file },
+            });
+            self.ring.push(RingSlot {
+                buffer,
+                wl_buffer,
+                busy: false,
+            });
+        }
+        let modifier = u64::from(DrmModifier::Linear);
+        self.ring_format = Some((fourcc, modifier));
+        tracing::info!(
+            w,
+            h,
+            format = format!("{shm_format:?}"),
+            buffers = self.cfg.buffers,
+            "capture ring allocated in shared memory"
         );
         let output = self
             .output
@@ -975,3 +1078,41 @@ delegate_noop!(State: ignore WlPointer);
 delegate_noop!(State: ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(State: ExtImageCaptureSourceV1);
 delegate_noop!(State: ExtImageCopyCaptureManagerV1);
+
+/// The shm format to capture in, with its DRM fourcc: the 32-bit RGB layouts
+/// `read_bgra` knows, XRGB first. `wl_shm` numbers ARGB8888 and XRGB8888 0 and
+/// 1; every other format uses its DRM fourcc.
+fn choose_shm_format(offered: &[u32]) -> Option<(wl_shm::Format, u32)> {
+    const PREFERRED: [(wl_shm::Format, DrmFourcc); 4] = [
+        (wl_shm::Format::Xrgb8888, DrmFourcc::Xrgb8888),
+        (wl_shm::Format::Argb8888, DrmFourcc::Argb8888),
+        (wl_shm::Format::Xbgr8888, DrmFourcc::Xbgr8888),
+        (wl_shm::Format::Abgr8888, DrmFourcc::Abgr8888),
+    ];
+    PREFERRED
+        .into_iter()
+        .find(|(f, _)| offered.contains(&(*f as u32)))
+        .map(|(f, drm)| (f, drm as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shm_format_prefers_xrgb_and_maps_to_drm() {
+        let xrgb = wl_shm::Format::Xrgb8888 as u32;
+        let argb = wl_shm::Format::Argb8888 as u32;
+        let abgr = wl_shm::Format::Abgr8888 as u32;
+        assert_eq!(
+            choose_shm_format(&[argb, xrgb]),
+            Some((wl_shm::Format::Xrgb8888, DrmFourcc::Xrgb8888 as u32))
+        );
+        assert_eq!(
+            choose_shm_format(&[abgr]),
+            Some((wl_shm::Format::Abgr8888, DrmFourcc::Abgr8888 as u32))
+        );
+        // NV12 is not a 32-bit RGB layout.
+        assert_eq!(choose_shm_format(&[0x3231_564e]), None);
+    }
+}

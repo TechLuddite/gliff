@@ -101,10 +101,29 @@ that probe order, when a new generation fails:
 - **Coded buffer status.** `VA_CODED_BUF_STATUS_*` bits are logged; a
   `BAD_BITSTREAM` status fails the encode and the server falls back to CPU.
 
+## Confirmed on NVIDIA (proprietary driver, as the server)
+
+Tested on an RTX 3090 with `nvidia-open` 610.57 and its GBM backend
+(`nvidia-drm_gbm.so`, `egl-gbm` 1.1.4), Hyprland, serving an AMD client.
+
+- **No VA-API H.264 encode.** The server takes the CPU tier, as expected.
+- **GBM cannot map capture buffers for the CPU.** `gbm_bo_map` fails on every
+  capture buffer, linear or not and whether allocated with the `LINEAR` flag
+  or the linear modifier, so the CPU encoder could not read a single frame
+  (`gbm: map: No such file or directory`). The capture now tries a map on the
+  first ring buffer and, when it fails, allocates the ring in `wl_shm` memfds
+  instead, which the compositor fills and the CPU reads with `read_at`. Such
+  a buffer has no dmabuf: the GPU encoder refuses it, which moves a session
+  to the CPU tier through the usual first-encode fallback, and `gliff-probe
+  pipeline` says so. `GLIFF_SHM_CAPTURE=1` forces the shared-memory ring on
+  any machine, to test the path.
+- Measured with `gliff-probe stream-bench --video cpu` on the 3090 machine,
+  mirroring a 2560x1440 screen: 19.8 fps, 18 Mbit/s, decoded latency p50
+  9.4 ms and p95 23.4 ms.
+
 ## Not yet tested anywhere
 - Intel generations before Panther Lake.
-- NVIDIA has no VA-API encoder; both ends take the CPU tier there. Decode
-  through `nvidia-vaapi-driver` is untried.
+- NVIDIA as the client, and decode through `nvidia-vaapi-driver`.
 - Baseline-profile streams (the CPU tier's output) through the VA-API High
   decode config: radeonsi accepts them, and so does iHD on Panther Lake
   (the e2e cpu-server -> gpu-client case); other drivers are unverified.

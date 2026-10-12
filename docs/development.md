@@ -48,7 +48,9 @@ gliff --connect 127.0.0.1:9000
 ```
 
 `--listen` and `--connect` have no authentication and are for development
-only. `--video cpu` (or `GLIFF_VIDEO=cpu`) on either end forces the CPU tier,
+only. `GLIFF_SHM_CAPTURE=1` on the server captures into shared memory instead
+of GBM dmabufs, the path a GPU whose GBM cannot map buffers takes (NVIDIA's);
+only the CPU tier reads it. `--video cpu` (or `GLIFF_VIDEO=cpu`) on either end forces the CPU tier,
 and `--full-chroma` on a CPU server keeps 4:4:4. Server and client pick their
 tiers independently, so every pairing can be tested on one machine.
 
