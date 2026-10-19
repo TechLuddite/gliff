@@ -338,8 +338,7 @@ where
             }
             // A silent client: release its held input at the first missed
             // deadline, and end the session once the grace period has passed.
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(heartbeat.borrow().deadline())) => {
-                let effect = heartbeat.borrow_mut().check(Instant::now());
+            effect = heartbeat_due(&heartbeat) => {
                 let input = &session.input;
                 act(effect, |cmd| {
                     let _ = input.send(cmd);
@@ -409,6 +408,17 @@ fn grace_for(headless: bool) -> Duration {
     }
 }
 
+/// Wait for the heartbeat's deadline and check it. The session loop makes
+/// this future again on every pass, so a message or a Ping that moved the
+/// deadline is seen.
+async fn heartbeat_due(heartbeat: &RefCell<Heartbeat>) -> Option<Effect> {
+    let at = heartbeat.borrow().deadline();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+    heartbeat
+        .borrow_mut()
+        .check(tokio::time::Instant::now().into_std())
+}
+
 /// Act on what the heartbeat decided: release held input when the client
 /// went silent, or end the session once the grace period has run out.
 fn act(effect: Option<Effect>, mut inject: impl FnMut(InputCmd)) -> ControlFlow<()> {
@@ -416,7 +426,9 @@ fn act(effect: Option<Effect>, mut inject: impl FnMut(InputCmd)) -> ControlFlow<
         None => ControlFlow::Continue(()),
         Some(Effect::Release) => {
             tracing::warn!("client stopped answering; releasing held input");
-            inject(InputCmd::ReleaseAll);
+            // Not ReleaseAll: the client is likely to come back, and its
+            // Caps Lock and layout must still match.
+            inject(InputCmd::ReleaseHeld);
             ControlFlow::Continue(())
         }
         Some(Effect::End) => {
@@ -1836,7 +1848,7 @@ mod tests {
         assert!(deadline(&mut hb, t0 + secs(29), &mut cmds).is_continue());
         assert!(cmds.is_empty());
         assert!(deadline(&mut hb, t0 + secs(30), &mut cmds).is_continue());
-        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseAll]));
+        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseHeld]));
     }
 
     #[test]
@@ -1882,7 +1894,7 @@ mod tests {
         let epoch = receive(&mut hb, t0 + secs(1), &key());
         let mut cmds = Vec::new();
         assert!(deadline(&mut hb, t0 + secs(31), &mut cmds).is_continue());
-        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseAll]));
+        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseHeld]));
         assert!(!handled(&hb, key(), epoch));
         // Still dropped once the client is back.
         let fresh = hb.ping(1000);
@@ -1960,6 +1972,25 @@ mod tests {
                 assert!(handled(&hb.borrow(), msg, epoch));
             })
             .await;
+    }
+
+    /// The session loop's deadline arm, on tokio's clock: nothing before the
+    /// deadline, a release at it, and the end once the grace has passed.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_arm_releases_then_ends_on_time() {
+        let t0 = tokio::time::Instant::now().into_std();
+        let hb = RefCell::new(Heartbeat::new(t0, GRACE_MIRROR));
+        let early = tokio::time::timeout(secs(29), heartbeat_due(&hb)).await;
+        assert!(early.is_err());
+        assert_eq!(heartbeat_due(&hb).await, Some(Effect::Release));
+        assert_eq!(tokio::time::Instant::now().into_std(), t0 + secs(30));
+        // A message while lost does not move the end.
+        hb.borrow_mut().arrived(t0 + secs(40));
+        assert_eq!(heartbeat_due(&hb).await, Some(Effect::End));
+        assert_eq!(
+            tokio::time::Instant::now().into_std(),
+            t0 + secs(30) + GRACE_MIRROR
+        );
     }
 
     #[test]

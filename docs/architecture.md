@@ -164,11 +164,12 @@ Every crate with `unsafe` documents the safety requirements at each block.
   The session pings the client every 2 s (`gliff-server/src/heartbeat.rs`),
   and any client message counts as a sign of life. The reader and writer
   tasks apply each message and each completed ping write to the shared
-  heartbeat as it happens, so queued work never distorts it. When nothing
-  arrives within 10 s of a ping finishing its write (30 s while writes are
-  blocked), held keys and buttons are released, and input received from
-  then on, or received before the release but not yet handled, is dropped
-  until a ping sent after that point is answered. A client that stays
+  heartbeat as it happens, so a backlog of queued messages cannot hide a
+  client that came back. When nothing arrives within 10 s of a ping
+  finishing its write (30 s while writes are blocked), held keys and
+  buttons are released, keeping locked modifiers and the layout, and input
+  received from then on, or received before the release but not yet
+  handled, is dropped until a ping sent after that point is answered. A client that stays
   silent ends the session after 5 minutes on a headless output, which a
   reconnect cannot reattach, or 60 s on a mirrored one, so a sleeping or
   disconnected client does not leave keys pressed.
