@@ -346,7 +346,7 @@ where
             }
             // A silent client: release its held input at the first missed
             // deadline, and end the session once the grace period has passed.
-            effect = heartbeat_due(&heartbeat) => {
+            effect = heartbeat_due(&heartbeat, heartbeat_enabled) => {
                 act(effect, |cmd| session.inject(cmd))
             }
             // The pace timer: fires when a frame waits only on the cadence.
@@ -405,7 +405,10 @@ fn grace_for(headless: bool) -> Duration {
 /// Wait for the heartbeat's deadline and check it. The session loop makes
 /// this future again on every pass, so a message or a Ping that moved the
 /// deadline is seen.
-async fn heartbeat_due(heartbeat: &RefCell<Heartbeat>) -> Option<Effect> {
+async fn heartbeat_due(heartbeat: &RefCell<Heartbeat>, enabled: bool) -> Option<Effect> {
+    if !enabled {
+        std::future::pending::<()>().await;
+    }
     let at = heartbeat.borrow().deadline();
     tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
     heartbeat
@@ -2067,19 +2070,30 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn legacy_clients_do_not_enter_heartbeat_loss_or_expiry() {
+        let t0 = tokio::time::Instant::now().into_std();
+        let hb = RefCell::new(Heartbeat::new(t0, GRACE_MIRROR));
+        assert!(tokio::time::timeout(secs(600), heartbeat_due(&hb, false))
+            .await
+            .is_err());
+        assert!(!hb.borrow().is_lost());
+        assert_eq!(hb.borrow().input_epoch(), Some(0));
+    }
+
     /// The session loop's deadline arm, on tokio's clock: nothing before the
     /// deadline, a release at it, and the end once the grace has passed.
     #[tokio::test(start_paused = true)]
     async fn the_deadline_arm_releases_then_ends_on_time() {
         let t0 = tokio::time::Instant::now().into_std();
         let hb = RefCell::new(Heartbeat::new(t0, GRACE_MIRROR));
-        let early = tokio::time::timeout(secs(29), heartbeat_due(&hb)).await;
+        let early = tokio::time::timeout(secs(29), heartbeat_due(&hb, true)).await;
         assert!(early.is_err());
-        assert_eq!(heartbeat_due(&hb).await, Some(Effect::Release));
+        assert_eq!(heartbeat_due(&hb, true).await, Some(Effect::Release));
         assert_eq!(tokio::time::Instant::now().into_std(), t0 + secs(30));
         // A message while lost does not move the end.
         hb.borrow_mut().arrived(t0 + secs(40));
-        assert_eq!(heartbeat_due(&hb).await, Some(Effect::End));
+        assert_eq!(heartbeat_due(&hb, true).await, Some(Effect::End));
         assert_eq!(
             tokio::time::Instant::now().into_std(),
             t0 + secs(30) + GRACE_MIRROR
