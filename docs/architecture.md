@@ -380,3 +380,6 @@ bindgen output for libva (`crates/gliff-va/bindings/gen.sh` regenerates it)
 plus the Wayland, GTK and async crates. The compute shaders are committed as
 SPIR-V, so no shader compiler is needed to build; rerun
 `crates/gliff-vk/shaders/build.sh` (needs `glslc`) after editing a shader.
+
+Heartbeat enforcement is negotiated with the `heartbeat` feature. Older clients
+retain the original session lifetime; upgraded clients answer every periodic Ping.

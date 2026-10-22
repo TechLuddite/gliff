@@ -214,6 +214,11 @@ where
     // The liveness clock starts here, so slow capture or input setup above
     // never counts as client silence. The reader and writer tasks run on
     // this thread and apply their events to it as they happen.
+    // Legacy clients keep the pre-heartbeat liveness contract.
+    let heartbeat_enabled = caps
+        .features
+        .iter()
+        .any(|f| f == gliff_proto::FEATURE_HEARTBEAT);
     let heartbeat = Rc::new(RefCell::new(Heartbeat::new(
         Instant::now(),
         grace_for(output.is_headless()),
@@ -331,7 +336,7 @@ where
             {
                 ControlFlow::Continue(())
             }
-            _ = pings.tick() => {
+            _ = pings.tick(), if heartbeat_enabled => {
                 let t = heartbeat.borrow_mut().ping(now_ms());
                 session.writer.send(ServerMsg::Ping { t }, Vec::new());
                 ControlFlow::Continue(())
