@@ -411,6 +411,9 @@ async fn heartbeat_due(heartbeat: &RefCell<Heartbeat>, enabled: bool) -> Option<
     }
     let at = heartbeat.borrow().deadline();
     tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+    // A slow compositor IPC call may have stalled this runtime. Let the
+    // reader apply Pongs already in the socket before declaring a loss.
+    tokio::task::yield_now().await;
     heartbeat
         .borrow_mut()
         .check(tokio::time::Instant::now().into_std())
@@ -2066,6 +2069,26 @@ mod tests {
                     panic!("expected the key")
                 };
                 assert!(handled(&hb.borrow(), msg, epoch));
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_reader_activity_prevents_a_false_loss_after_a_runtime_stall() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let t0 = tokio::time::Instant::now().into_std();
+                let hb = Rc::new(RefCell::new(Heartbeat::new(t0, GRACE_MIRROR)));
+                hb.borrow_mut().written(t0);
+                tokio::time::advance(secs(11)).await;
+                let reader = hb.clone();
+                tokio::task::spawn_local(async move {
+                    reader
+                        .borrow_mut()
+                        .arrived(tokio::time::Instant::now().into_std());
+                });
+                assert_eq!(heartbeat_due(&hb, true).await, None);
+                assert!(!hb.borrow().is_lost());
             })
             .await;
     }

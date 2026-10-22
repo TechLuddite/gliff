@@ -451,7 +451,8 @@ pub enum ServerMsg {
         #[n(0)]
         id: u32,
     },
-    /// Sent after HelloAck and periodically while streaming. The client
+    /// Sent after HelloAck, and periodically while streaming when the client
+    /// advertises `FEATURE_HEARTBEAT`. The client
     /// answers every Ping with `ClientMsg::Pong`, including on a still screen.
     /// The first reply seeds the server's round-trip estimate.
     #[n(12)]
